@@ -1,0 +1,185 @@
+name: Archive sub-issues when parent archived
+
+# NOTE: This relies on the Projects (v2) webhook event. If your org/repo does not yet
+# expose 'projects_v2_item' events to GitHub Actions, you may need to add a repository
+# dispatch or a scheduled fallback. Adjust as needed.
+
+on:
+  # Trigger on Project v2 item updates (including archive state changes)
+  projects_v2_item:
+    types: [edited]
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      parent_issue_number:
+        description: "Parent issue number to process manually"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  projects: write
+
+jobs:
+  archive-subissues:
+    name: Archive sub-issues if parent archived
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate trigger & extract parent issue
+        id: prep
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const core = require('@actions/core');
+            let parentIssueNumber = core.getInput('parent_issue_number');
+
+            // Detect if this is a projects_v2_item event
+            const isProjectsEvent = context.eventName === 'projects_v2_item';
+            if (isProjectsEvent) {
+              core.info('Processing projects_v2_item payload');
+              const item = context.payload.projects_v2_item;
+              if (!item) {
+                core.warning('No projects_v2_item payload found – exiting');
+                return core.setOutput('skip', 'true');
+              }
+              // We only proceed if the item just became archived (best-effort heuristic)
+              // Payload shape may evolve; we defensively check multiple possibilities.
+              const archived = item.archived === true || item.is_archived === true || (item.archived_at ? true : false);
+              const changedArchived = (context.payload.changes && context.payload.changes.archived) ? true : false;
+
+              if (!archived || !changedArchived) {
+                core.info('Item is not newly archived; skipping');
+                return core.setOutput('skip', 'true');
+              }
+
+              if (item.content && item.content.type === 'Issue' && item.content.number) {
+                parentIssueNumber = item.content.number;
+              } else {
+                core.warning('Archived item is not an issue; skipping');
+                return core.setOutput('skip', 'true');
+              }
+              core.setOutput('project_id', item.project_node_id || item.project_id || '');
+            }
+
+            if (!parentIssueNumber) {
+              core.info('No parent issue number provided or detected; nothing to do');
+              return core.setOutput('skip', 'true');
+            }
+            core.setOutput('parent_issue_number', parentIssueNumber);
+            core.setOutput('skip', 'false');
+      - name: Archive sub-issues
+        if: steps.prep.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        env:
+          PARENT_ISSUE_NUMBER: ${{ steps.prep.outputs.parent_issue_number }}
+          PROJECT_NODE_ID: ${{ steps.prep.outputs.project_id }}
+        with:
+          script: |
+            const parentIssueNumber = parseInt(process.env.PARENT_ISSUE_NUMBER, 10);
+            const projectNodeId = process.env.PROJECT_NODE_ID || null;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const graphql = github.graphql;
+
+            // Fetch parent issue body + tracked issues via GraphQL
+            const parentData = await graphql(
+              `query($owner:String!, $repo:String!, $number:Int!){
+                repository(owner:$owner, name:$repo){
+                  issue(number:$number){
+                    id
+                    number
+                    body
+                    trackedIssues(first:100){
+                      nodes { id number repository { name owner { login } } }
+                    }
+                    projectItems(first:50){
+                      nodes { id archived project { id title } }
+                    }
+                  }
+                }
+              }`, { owner, repo, number: parentIssueNumber }
+            );
+
+            const parentIssue = parentData.repository.issue;
+            if (!parentIssue) {
+              core.warning(`Parent issue #${parentIssueNumber} not found.`);
+              return;
+            }
+
+            // Determine the project node id if not provided (best effort)
+            let projectId = projectNodeId;
+            if (!projectId) {
+              const item = parentIssue.projectItems.nodes.find(n => !n.archived);
+              if (item) projectId = item.project.id;
+            }
+            if (!projectId) {
+              core.warning('Could not determine project id; aborting archival of sub-issues.');
+              return;
+            }
+
+            // Collect tracked issue numbers
+            const tracked = parentIssue.trackedIssues.nodes || [];
+            // Also parse task list from body as fallback (#123 pattern)
+            const bodyIssueRefs = [...new Set((parentIssue.body.match(/(?<!\w)#(\d+)/g) || []).map(m => parseInt(m.slice(1),10)))];
+
+            const allReferencedNumbers = [...new Set([
+              ...tracked.map(t => (t.repository.owner.login === owner && t.repository.name === repo) ? t.number : null).filter(Boolean),
+              ...bodyIssueRefs
+            ])].filter(n => n !== parentIssueNumber);
+
+            if (allReferencedNumbers.length === 0) {
+              core.info('No sub-issues detected to archive.');
+              return;
+            }
+            core.info(`Detected sub-issues: ${allReferencedNumbers.join(', ')}`);
+
+            // For each sub-issue, find its project item within this project and archive it.
+            const mutation = `mutation($itemId:ID!){
+              updateProjectV2Item(input:{itemId:$itemId, archived:true}){
+                projectV2Item { id archived }
+              }
+            }`;
+
+            const archivedResults = [];
+
+            for (const issueNumber of allReferencedNumbers) {
+              try {
+                const issueData = await graphql(
+                  `query($owner:String!, $repo:String!, $number:Int!){
+                    repository(owner:$owner, name:$repo){
+                      issue(number:$number){
+                        id
+                        number
+                        projectItems(first:50){
+                          nodes { id archived project { id title } }
+                        }
+                      }
+                    }
+                  }`, { owner, repo, number: issueNumber }
+                );
+                const subIssue = issueData.repository.issue;
+                if (!subIssue) {
+                  core.warning(`Issue #${issueNumber} not found`);
+                  continue;
+                }
+                const targetItem = subIssue.projectItems.nodes.find(n => n.project.id === projectId && !n.archived);
+                if (!targetItem) {
+                  core.info(`No active project item for issue #${issueNumber} in target project`);
+                  continue;
+                }
+                const result = await graphql(mutation, { itemId: targetItem.id });
+                if (result.updateProjectV2Item.projectV2Item.archived) {
+                  core.info(`Archived project item for issue #${issueNumber}`);
+                  archivedResults.push(issueNumber);
+                }
+              } catch (err) {
+                core.warning(`Failed to archive issue #${issueNumber}: ${err.message}`);
+              }
+            }
+
+            core.setOutput('archived_subissues', archivedResults.join(','));
+      - name: Summary
+        if: steps.prep.outputs.skip == 'false'
+        run: |
+          echo "Archived sub-issues: ${{ steps.archive-subissues.outputs.archived_subissues }}" || echo "No sub-issues archived"
